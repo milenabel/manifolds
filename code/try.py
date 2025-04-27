@@ -1,4 +1,3 @@
-# Corrected train_new.py to properly calculate generalization error only once after training
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,30 +9,31 @@ from utils import get_scheduler, save_results
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
-# Relative L2 Error
+# === Relative L2 Error ===
 def compute_relative_l2_error(pred, target):
     l2_error = torch.norm(pred - target, p=2).item()
     norm = torch.norm(target, p=2).item()
     return l2_error / norm
 
-# Data Loader for full f (no sensors)
+# === Data Loader ===
 def load_full_f_data(data_file):
     data = np.load(data_file)
-    f = data['f']               # (N, 1) or (N,)
-    X = data['X']               # (N, 3)
-    nr = data['nr']             # (N, 3)
-    u = data['u_num']           # (N,)
+    f = data['f']
+    X = data['X']
+    nr = data['nr']
+    u = data['u_num']
 
     N_pts = len(X)
-    f_tensor = torch.tensor(f, dtype=torch.float32).T  # shape: (1, N)
-    branch_inputs = f_tensor.repeat(N_pts, 1)          # shape: (N, N)
+    f_tensor = torch.tensor(f, dtype=torch.float32).T  # (1, N)
+
+    branch_inputs = f_tensor.expand(N_pts, -1)         # (N_pts, N) lightweight expansion
     normals = torch.tensor(nr, dtype=torch.float32)
     trunk_inputs = torch.tensor(X, dtype=torch.float32)
     targets = torch.tensor(u, dtype=torch.float32).unsqueeze(1)
 
     return branch_inputs, normals, trunk_inputs, targets
 
-# Training Loop
+# === Training Loop ===
 def train_deeponet_encoder(config, generalization_files, save_every=1000):
     model = DeepONetDualBranch(
         input_dim_branch1=config['input_dim_branch1'],
@@ -43,7 +43,8 @@ def train_deeponet_encoder(config, generalization_files, save_every=1000):
         output_dim=config['output_dim'],
         activation=config['activation'],
         spectral_norm=config['spectral_norm'],
-        trunk_activation=config['trunk_activation']
+        trunk_activation=config['trunk_activation'],
+        encoder_latent_dim=config['encoder_latent_dim']
     )
 
     optimizer = optim.Adam(model.parameters(), lr=config['lr'])
@@ -54,6 +55,7 @@ def train_deeponet_encoder(config, generalization_files, save_every=1000):
 
     train_losses, test_losses = [], []
     test_rel_l2s = []
+    learning_rates = []
 
     for epoch in range(config['epochs']):
         model.train()
@@ -68,6 +70,10 @@ def train_deeponet_encoder(config, generalization_files, save_every=1000):
         scheduler.step()
 
         avg_train_loss = running_loss / len(config['train_dataset'])
+
+        # Record learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
 
         model.eval()
         test_preds, test_targets = [], []
@@ -110,8 +116,10 @@ def train_deeponet_encoder(config, generalization_files, save_every=1000):
         "N_train_rhs": config['n_train'],
         "N_test_rhs": config['n_test'],
         "N_generalization_rhs": config['n_generalization'],
-        "xi": config['xi']
+        "xi": config['xi'],
+        "learning_rates": learning_rates   # NEW
     }
+
 
     os.makedirs("../results/encoder", exist_ok=True)
     torch.save(model.state_dict(), f"../results/encoder/model_xi{config['xi']}_train{config['n_train']}_test{config['n_test']}.pt")
@@ -124,11 +132,9 @@ def train_deeponet_encoder(config, generalization_files, save_every=1000):
 # === Main ===
 if __name__ == "__main__":
     xi = 4
-    data_files = sorted(glob.glob(f"../data/torus_N*_xi{xi}_f*.npz"))
+    data_files = sorted(glob.glob(f"../data/torus_N*_xi{xi}_f*.npz"))[:20]  # limit files for now
 
-    # First split: 60% train, 40% temp
     train_files, temp_files = train_test_split(data_files, test_size=0.4, random_state=42)
-    # Second split: 20% validation, 20% generalization
     test_files, generalization_files = train_test_split(temp_files, test_size=0.5, random_state=24)
 
     train_data, test_data = [], []
@@ -160,6 +166,7 @@ if __name__ == "__main__":
         'schedule_type': 'cosine',
         'epochs': 5000,
         'batch_size': 256,
+        'encoder_latent_dim': 128,
         'train_dataset': train_dataset,
         'test_dataset': test_dataset,
         'n_train': len(train_files),
