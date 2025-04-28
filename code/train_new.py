@@ -1,155 +1,195 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
+from deeponet_new import DeepONetDualBranch, BranchNet, TrunkNet
+from utils import get_scheduler, save_results
+import numpy as np
 import glob
 import os
-import numpy as np
-from deeponet_new import DeepONetDualBranch
-from utils import get_scheduler, save_results
-from sklearn.model_selection import train_test_split
 
-# L2 Error 
-def compute_relative_l2_error(pred, target):
-    l2_error = torch.norm(pred - target, p=2).item()
-    norm = torch.norm(target, p=2).item()
-    return l2_error / norm
+# Detect device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
-# Data Loader 
-def load_dual_branch_data(data_file, sensor_file):
-    data = np.load(data_file)
-    f = data["f"]
-    X = data["X"]
-    nr = data["nr"]
-    u = data["u_num"]
-    sensor_idx = np.load(sensor_file)
+# Helper Functions
+def compute_relative_l2_error(predictions, targets):
+    l2_error = torch.norm(predictions - targets, p=2).item()
+    target_norm = torch.norm(targets, p=2).item()
+    return l2_error / target_norm
 
-    branch1_inputs = []
-    branch2_inputs = []
-    trunk_inputs = []
-    targets = []
+def load_torus_data_split(file_path, max_points=6000, generalization_fraction=0.02, test_fraction=0.2):
+    data = np.load(file_path)
+    f = data['f']
+    X = data['X']
+    nr = data['nr']  # normal vectors
+    u = data['u_num']
 
-    for i in range(len(X)):
-        trunk_inputs.append(X[i])                    # (3,)
-        branch2_inputs.append(nr[i])                 # (3,)
-        targets.append(np.array(u[i], ndmin=1))      # (1,)
-        branch1_inputs.append(f[sensor_idx])         # (n_sensors,)
+    N_total = len(X)
+    if N_total > max_points:
+        idx_selected = np.random.choice(N_total, max_points, replace=False)
+        X = X[idx_selected]
+        nr = nr[idx_selected]
+        u = u[idx_selected]
 
-    return (
-        torch.tensor(branch1_inputs, dtype=torch.float32),
-        torch.tensor(branch2_inputs, dtype=torch.float32),
-        torch.tensor(trunk_inputs, dtype=torch.float32),
-        torch.tensor(targets, dtype=torch.float32),
-        len(X)
-    )
+    branch_f_inputs = torch.tensor(np.array([f.flatten() for _ in range(len(X))]), dtype=torch.float32)
+    branch_n_inputs = torch.tensor(nr, dtype=torch.float32)
+    trunk_inputs = torch.tensor(X, dtype=torch.float32)
+    targets = torch.tensor(u[:, None], dtype=torch.float32)
+
+    N_pts = len(X)
+    N_gen = max(1, int(generalization_fraction * N_pts))
+    idx = np.random.permutation(N_pts)
+
+    idx_gen = idx[:N_gen]
+    idx_remain = idx[N_gen:]
+
+    idx_test = idx_remain[:int(test_fraction * len(idx_remain))]
+    idx_train = idx_remain[int(test_fraction * len(idx_remain)) :]
+
+    def slice_data(idxs):
+        return (branch_f_inputs[idxs], branch_n_inputs[idxs], trunk_inputs[idxs], targets[idxs])
+
+    return slice_data(idx_train) + slice_data(idx_test) + slice_data(idx_gen)
 
 # Training Loop
-def train_dual_branch_deeponet(config, save_every=1000):
-    model = DeepONetDualBranch(
-        input_dim_branch1=config['input_dim_branch1'],
-        input_dim_branch2=config['input_dim_branch2'],
-        input_dim_trunk=config['input_dim_trunk'],
-        hidden_dims=config['hidden_dims'],
-        output_dim=config['output_dim'],
-        activation=config['activation'],
-        spectral_norm=config['spectral_norm']
+def train_deeponet(config, save_every=1000):
+    branch_f_net = BranchNet(
+        input_dim=config['input_dim_branch_f'],
+        hidden_dims=[128, 128],
+        output_dim=128
     )
 
-    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
+    branch_n_net = BranchNet(
+        input_dim=config['input_dim_branch_n'],
+        hidden_dims=[128, 128],
+        output_dim=128
+    )
+
+    trunk_net = TrunkNet(
+        input_dim=config['input_dim_trunk'],
+        hidden_dims=[128, 128],
+        output_dim=128
+    )
+
+    deeponet = DeepONetDualBranch(branch_f_net, branch_n_net, trunk_net).to(device)
+
+    optimizer = optim.Adam(deeponet.parameters(), lr=config['lr'])
     scheduler = get_scheduler(optimizer, config['schedule_type'])
 
-    # 80/20 split
-    b1_train, b1_test, b2_train, b2_test, trunk_train, trunk_test, tgt_train, tgt_test = train_test_split(
-        config['branch1_input'], config['branch2_input'],
-        config['trunk_input'], config['targets'],
-        test_size=0.2, random_state=42
-    )
+    branch_f_train = config['branch_f_train'].to(device)
+    branch_n_train = config['branch_n_train'].to(device)
+    trunk_train = config['trunk_train'].to(device)
+    targets_train = config['targets_train'].to(device)
 
-    train_losses, test_losses = [], []
-    train_rel_l2s, test_rel_l2s = [], []
+    branch_f_test = config['branch_f_test'].to(device)
+    branch_n_test = config['branch_n_test'].to(device)
+    trunk_test = config['trunk_test'].to(device)
+    targets_test = config['targets_test'].to(device)
+
+    branch_f_gen = config['branch_f_gen'].to(device)
+    branch_n_gen = config['branch_n_gen'].to(device)
+    trunk_gen = config['trunk_gen'].to(device)
+    targets_gen = config['targets_gen'].to(device)
+
+    train_dataset = torch.utils.data.TensorDataset(branch_f_train, branch_n_train, trunk_train, targets_train)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+
     epochs = config['epochs']
+    losses, train_errors, test_errors, learning_rates = [], [], [], []
 
     for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        train_preds = model(b1_train, b2_train, trunk_train)
-        train_loss = nn.MSELoss()(train_preds, tgt_train)
-        train_loss.backward()
-        optimizer.step()
+        deeponet.train()
+        running_loss = 0.0
+
+        for b1_batch, b2_batch, x_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            preds = deeponet(b1_batch, b2_batch, x_batch)
+            loss = torch.nn.MSELoss()(preds, y_batch)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * len(y_batch)
+
         scheduler.step()
+        avg_loss = running_loss / len(train_dataset)
 
-        train_rel_l2 = compute_relative_l2_error(train_preds, tgt_train)
-
-        model.eval()
+        deeponet.eval()
         with torch.no_grad():
-            test_preds = model(b1_test, b2_test, trunk_test)
-            test_loss = nn.MSELoss()(test_preds, tgt_test).item()
-            test_rel_l2 = compute_relative_l2_error(test_preds, tgt_test)
+            preds_train = deeponet(branch_f_train, branch_n_train, trunk_train)
+            preds_test = deeponet(branch_f_test, branch_n_test, trunk_test)
 
-        train_losses.append(train_loss.item())
-        test_losses.append(test_loss)
-        train_rel_l2s.append(train_rel_l2)
-        test_rel_l2s.append(test_rel_l2)
+            train_error = compute_relative_l2_error(preds_train, targets_train)
+            test_error = compute_relative_l2_error(preds_test, targets_test)
+
+            current_lr = optimizer.param_groups[0]['lr']
+
+        losses.append(avg_loss)
+        train_errors.append(train_error)
+        test_errors.append(test_error)
+        learning_rates.append(current_lr)
 
         if epoch % 100 == 0:
-            print(f"[Epoch {epoch}] Train Loss: {train_loss.item():.4e}, Test Loss: {test_loss:.4e}, Rel L2 Train: {train_rel_l2:.4e}, Rel L2 Test: {test_rel_l2:.4e}")
+            print(f"Epoch {epoch}, Train Rel L2: {train_error:.4e}, Test Rel L2: {test_error:.4e}")
 
-        if epoch % save_every == 0 or epoch == epochs - 1:
-            results = {
-                "train_losses": train_losses,
-                "test_losses": test_losses,
-                "train_relative_l2_errors": train_rel_l2s,
-                "test_relative_l2_errors": test_rel_l2s,
-                "avg_train_relative_l2_error": sum(train_rel_l2s) / len(train_rel_l2s),
-                "avg_test_relative_l2_error": sum(test_rel_l2s) / len(test_rel_l2s),
-                "generalization_error": test_rel_l2s[-1],  # <- this line
-                "n_sensors": config['n_sensors'],
-                "N": config['N'],
-                "xi": config['xi']
-            }
+    # Generalization Error After Full Training
+    deeponet.eval()
+    with torch.no_grad():
+        preds_gen = deeponet(branch_f_gen, branch_n_gen, trunk_gen)
+        gen_error = compute_relative_l2_error(preds_gen, targets_gen)
 
-            os.makedirs("../results/new", exist_ok=True)
-            torch.save(model.state_dict(), f"../results/new/model_N{config['N']}_xi{config['xi']}_sensors{config['n_sensors']}.pt")
-            save_results(results, f"../results/new/deeponet_dual_results_N{config['N']}_xi{config['xi']}_sensors{config['n_sensors']}.json")
+    print(f"\nFinal Generalization Error (New DeepONet): {gen_error:.4e}")
 
-    return min(test_rel_l2s)
+    results = {
+        "losses": losses,
+        "train_errors": train_errors,
+        "test_errors": test_errors,
+        "generalization_error": gen_error,
+        "avg_train_error": sum(train_errors) / len(train_errors),
+        "avg_test_error": sum(test_errors) / len(test_errors),
+        "N": config['N'],
+        "xi": config['xi'],
+        "learning_rates": learning_rates
+    }
 
-# Main
+    os.makedirs("../results/new", exist_ok=True)
+    result_path = f"../results/new/deeponet_results_torus_N{config['N']}_xi{config['xi']}.json"
+    save_results(results, result_path)
+    torch.save(deeponet.state_dict(), f"../results/new/model_N{config['N']}_xi{config['xi']}.pt")
+
+# Main Driver
 if __name__ == "__main__":
     xi = 4
-    sensor_counts = [100, 200, 300]
     data_files = sorted(glob.glob(f"../data/torus_N*_xi{xi}_f0.npz"))
 
     for file_path in data_files:
-        basename = os.path.basename(file_path)
-        N = int(basename.split("_")[1][1:])
+        base = os.path.basename(file_path)
+        N = int(base.split("_")[1][1:])  # True N from filename
 
-        for n_sensors in sensor_counts:
-            sensor_file = f"../data/sensor_indices_{N}_xi{xi}_sensors{n_sensors}.npy"
-            if not os.path.exists(sensor_file):
-                print(f"Skipping N={N}, sensors={n_sensors} (sensor file missing)")
-                continue
+        print(f"\n--- Training New DeepONet for N={N}, xi={xi} ---")
+        (branch_f_train, branch_n_train, trunk_train, targets_train,
+         branch_f_test, branch_n_test, trunk_test, targets_test,
+         branch_f_gen, branch_n_gen, trunk_gen, targets_gen) = load_torus_data_split(file_path)
 
-            print(f"\n--- Training DualBranchDeepONet for N={N}, xi={xi}, sensors={n_sensors} ---")
-            b1, b2, trunk, target, N_actual = load_dual_branch_data(file_path, sensor_file)
+        config = {
+            'input_dim_branch_f': branch_f_train.shape[1],
+            'input_dim_branch_n': branch_n_train.shape[1],
+            'input_dim_trunk': trunk_train.shape[1],
+            'xi': xi,
+            'N': N,   # <-- pass the true N from filename, NOT from len(...)
+            'lr': 0.001,
+            'schedule_type': 'cosine',
+            'epochs': 10000,
+            'batch_size': 512,
+            'branch_f_train': branch_f_train,
+            'branch_n_train': branch_n_train,
+            'trunk_train': trunk_train,
+            'targets_train': targets_train,
+            'branch_f_test': branch_f_test,
+            'branch_n_test': branch_n_test,
+            'trunk_test': trunk_test,
+            'targets_test': targets_test,
+            'branch_f_gen': branch_f_gen,
+            'branch_n_gen': branch_n_gen,
+            'trunk_gen': trunk_gen,
+            'targets_gen': targets_gen
+        }
 
-            config = {
-                'input_dim_branch1': b1.shape[1],
-                'input_dim_branch2': b2.shape[1],
-                'input_dim_trunk': trunk.shape[1],
-                'hidden_dims': [128, 128],
-                'activation': 'relu',
-                'spectral_norm': False,
-                'output_dim': 1,
-                'xi': xi,
-                'N': N_actual,
-                'n_sensors': n_sensors,
-                'lr': 0.001,
-                'schedule_type': 'cosine',
-                'epochs': 10000,
-                'branch1_input': b1,
-                'branch2_input': b2,
-                'trunk_input': trunk,
-                'targets': target
-            }
-
-            train_dual_branch_deeponet(config)
+        train_deeponet(config)
