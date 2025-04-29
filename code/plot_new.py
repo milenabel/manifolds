@@ -7,7 +7,7 @@ import json
 import csv
 from deeponet_new import DeepONetDualBranch, BranchNet, TrunkNet
 
-# === Settings ===
+# Settings
 xi = 4
 fig_save_dir = "../figs/new"
 model_dir = "../results/new"
@@ -20,7 +20,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 os.makedirs(fig_save_dir, exist_ok=True)
 
-# === Gather result files ===
+# Gather result files 
 result_files = sorted(glob.glob(f"{model_dir}/deeponet_results_torus_N*_xi{xi}.json"))
 point_sets = []
 
@@ -30,7 +30,7 @@ for result_path in result_files:
     base = os.path.basename(result_path)
     parts = base.replace(".json", "").split("_")
 
-    N = int(parts[3][1:])  # From filename N38400 → 38400
+    N = int(parts[3][1:])  
 
     with open(result_path, "r") as f:
         results = json.load(f)
@@ -59,7 +59,7 @@ plt.tight_layout()
 plt.savefig(f"{fig_save_dir}/train_test_gen_vs_epoch_all.png", dpi=300)
 plt.close()
 
-# === Save Train/Test/Generalization Error plots per N ===
+# Save Train/Test/Generalization Error plots per N
 for N, epochs, train_errors, test_errors, gen_error in sorted(point_sets):
     plt.figure(figsize=(8, 5))
     plt.plot(epochs, train_errors, label="Train Error")
@@ -76,7 +76,7 @@ for N, epochs, train_errors, test_errors, gen_error in sorted(point_sets):
     plt.savefig(f"{fig_save_dir}/train_test_gen_vs_epoch_N{N}.png", dpi=300)
     plt.close()
 
-# === Save CSV Summary ===
+# Save CSV Summary
 csv_path = f"{fig_save_dir}/summary_results.csv"
 with open(csv_path, mode='w', newline='') as file:
     writer = csv.writer(file)
@@ -88,7 +88,7 @@ with open(csv_path, mode='w', newline='') as file:
 
 print(f"Saved all plots and summary CSV to {fig_save_dir}")
 
-# === Predict and plot true vs predicted solutions ===
+# Predict and plot true vs predicted solutions
 
 # Load model and plot predictions
 model_files = sorted(glob.glob(f"{model_dir}/model_N*_xi{xi}.pt"))
@@ -97,7 +97,7 @@ for model_path in model_files:
     base = os.path.basename(model_path)
     parts = base.replace(".pt", "").split("_")
 
-    N = int(parts[1][1:])  # N38400 → 38400
+    N = int(parts[1][1:])  
     data_file = f"{data_dir}/torus_N{N}_xi{xi}_f0.npz"
 
     if not os.path.exists(data_file):
@@ -115,7 +115,7 @@ for model_path in model_files:
     branch_n_input = torch.tensor(nr, dtype=torch.float32)
     trunk_input = torch.tensor(X, dtype=torch.float32)
 
-    # === Build model ===
+    # Build model
     branch_f_net = BranchNet(
         input_dim=branch_f_input.shape[1],
         hidden_dims=hidden_dims,

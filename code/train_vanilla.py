@@ -1,13 +1,13 @@
 import torch
 import torch.optim as optim
-from deeponet_vanilla import DeepONet, BranchNet, TrunkNet
-from encoder import SimpleEncoder
-from utils import get_scheduler, save_results
 import numpy as np
 import glob
 import os
+import json
+from deeponet_vanilla import DeepONet, BranchNet, TrunkNet
+from utils import get_scheduler, save_results
 
-# Detect device
+# Device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
@@ -41,55 +41,36 @@ def load_torus_data_split(file_path, max_points=6000, generalization_fraction=0.
     idx_gen = idx[:N_gen]
     idx_remain = idx[N_gen:]
 
-    branch_gen = branch_inputs[idx_gen]
-    trunk_gen = trunk_inputs[idx_gen]
-    targets_gen = targets[idx_gen]
+    idx_test = idx_remain[:int(test_fraction * len(idx_remain))]
+    idx_train = idx_remain[int(test_fraction * len(idx_remain)) :]
 
-    N_remain = len(idx_remain)
-    N_test = int(test_fraction * N_remain)
-    idx_test = idx_remain[:N_test]
-    idx_train = idx_remain[N_test:]
+    def slice_data(idxs):
+        return branch_inputs[idxs], trunk_inputs[idxs], targets[idxs]
 
-    branch_train = branch_inputs[idx_train]
-    trunk_train = trunk_inputs[idx_train]
-    targets_train = targets[idx_train]
+    return slice_data(idx_train) + slice_data(idx_test) + slice_data(idx_gen)
 
-    branch_test = branch_inputs[idx_test]
-    trunk_test = trunk_inputs[idx_test]
-    targets_test = targets[idx_test]
-
-    return (branch_train, trunk_train, targets_train,
-            branch_test, trunk_test, targets_test,
-            branch_gen, trunk_gen, targets_gen)
-
-# Training Loop 
-def train_deeponet(config, save_every=1000):
-    output_dim = 128
-
-    encoder_f = SimpleEncoder(config['input_dim_branch'], latent_dim=128).to(device)
-
-    branch_net = BranchNet(128, [128, 128], 128, activation='relu', spectral_norm=False, use_layernorm=False)
-    trunk_net = TrunkNet(config['input_dim_trunk'], [128, 128], 128, activation='tanh', spectral_norm=False, use_layernorm=False)
-
+# Training Loop
+def train_deeponet(config):
+    branch_net = BranchNet(config['input_dim_branch'], [128, 128], 128)
+    trunk_net = TrunkNet(config['input_dim_trunk'], [128, 128], 128)
     deeponet = DeepONet(branch_net, trunk_net).to(device)
-
-    with torch.no_grad():
-        encoded_f = encoder_f(config['branch_input'][0:1, :].to(device)).squeeze(0)
 
     optimizer = optim.Adam(deeponet.parameters(), lr=config['lr'])
     scheduler = get_scheduler(optimizer, config['schedule_type'])
 
-    branch_input = config['branch_input'].to(device)
-    trunk_input = config['trunk_input'].to(device)
-    targets = config['targets'].to(device)
+    branch_train = config['branch_train'].to(device)
+    trunk_train = config['trunk_train'].to(device)
+    targets_train = config['targets_train'].to(device)
 
-    trunk_input_test = config['trunk_input_test'].to(device)
+    branch_test = config['branch_test'].to(device)
+    trunk_test = config['trunk_test'].to(device)
     targets_test = config['targets_test'].to(device)
 
-    trunk_input_gen = config['trunk_input_gen'].to(device)
+    branch_gen = config['branch_gen'].to(device)
+    trunk_gen = config['trunk_gen'].to(device)
     targets_gen = config['targets_gen'].to(device)
 
-    train_dataset = torch.utils.data.TensorDataset(branch_input, trunk_input, targets)
+    train_dataset = torch.utils.data.TensorDataset(branch_train, trunk_train, targets_train)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
 
     epochs = config['epochs']
@@ -99,9 +80,9 @@ def train_deeponet(config, save_every=1000):
         deeponet.train()
         running_loss = 0.0
 
-        for _, x_batch, y_batch in train_loader:
+        for b_batch, t_batch, y_batch in train_loader:
             optimizer.zero_grad()
-            preds = deeponet(encoded_f, x_batch)
+            preds = deeponet(b_batch, t_batch)
             loss = torch.nn.MSELoss()(preds, y_batch)
             loss.backward()
             optimizer.step()
@@ -112,10 +93,12 @@ def train_deeponet(config, save_every=1000):
 
         deeponet.eval()
         with torch.no_grad():
-            preds_train = deeponet(encoded_f, trunk_input)
-            preds_test = deeponet(encoded_f, trunk_input_test)
-            train_error = compute_relative_l2_error(preds_train, targets)
+            preds_train = deeponet(branch_train, trunk_train)
+            preds_test = deeponet(branch_test, trunk_test)
+
+            train_error = compute_relative_l2_error(preds_train, targets_train)
             test_error = compute_relative_l2_error(preds_test, targets_test)
+
             current_lr = optimizer.param_groups[0]['lr']
 
         losses.append(avg_loss)
@@ -124,15 +107,15 @@ def train_deeponet(config, save_every=1000):
         learning_rates.append(current_lr)
 
         if epoch % 100 == 0:
-            print(f"Epoch {epoch}, Train Rel L2: {train_error:.4e}, Test Error: {test_error:.4e}")
+            print(f"Epoch {epoch}, Train Rel L2: {train_error:.4e}, Test Rel L2: {test_error:.4e}")
 
-    # Generalization Error after training ends
+    # Generalization Error After Full Training
     deeponet.eval()
     with torch.no_grad():
-        preds_gen = deeponet(encoded_f, trunk_input_gen)
+        preds_gen = deeponet(branch_gen, trunk_gen)
         gen_error = compute_relative_l2_error(preds_gen, targets_gen)
 
-    print(f"\nFinal Generalization Error (Vanilla): {gen_error:.4e}")
+    print(f"\nFinal Generalization Error (Vanilla DeepONet): {gen_error:.4e}")
 
     results = {
         "losses": losses,
@@ -169,20 +152,21 @@ if __name__ == "__main__":
             'input_dim_branch': branch_train.shape[1],
             'input_dim_trunk': trunk_train.shape[1],
             'xi': xi,
-            'N': N,  # <- use the ORIGINAL N here
+            'N': N,  
             'lr': 0.001,
             'schedule_type': 'cosine',
             'epochs': 10000,
             'batch_size': 512,
-            'branch_input': branch_train,
-            'trunk_input': trunk_train,
-            'targets': targets_train,
-            'branch_input_test': branch_test,
-            'trunk_input_test': trunk_test,
+            'branch_train': branch_train,
+            'trunk_train': trunk_train,
+            'targets_train': targets_train,
+            'branch_test': branch_test,
+            'trunk_test': trunk_test,
             'targets_test': targets_test,
-            'branch_input_gen': branch_gen,
-            'trunk_input_gen': trunk_gen,
+            'branch_gen': branch_gen,
+            'trunk_gen': trunk_gen,
             'targets_gen': targets_gen
         }
+
 
         train_deeponet(config)

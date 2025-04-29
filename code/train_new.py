@@ -161,7 +161,7 @@ if __name__ == "__main__":
 
     for file_path in data_files:
         base = os.path.basename(file_path)
-        N = int(base.split("_")[1][1:])  # True N from filename
+        N = int(base.split("_")[1][1:])  
 
         print(f"\n--- Training New DeepONet for N={N}, xi={xi} ---")
         (branch_f_train, branch_n_train, trunk_train, targets_train,
@@ -173,7 +173,7 @@ if __name__ == "__main__":
             'input_dim_branch_n': branch_n_train.shape[1],
             'input_dim_trunk': trunk_train.shape[1],
             'xi': xi,
-            'N': N,   # <-- pass the true N from filename, NOT from len(...)
+            'N': N,   
             'lr': 0.001,
             'schedule_type': 'cosine',
             'epochs': 10000,

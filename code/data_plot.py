@@ -17,10 +17,10 @@ files = list(data_dir.glob("torus_N*_xi*_f0.npz"))
 xi_to_data = {xi: [] for xi in xi_list}
 
 for file in files:
-    name = file.stem  # without .npz
+    name = file.stem  
     parts = name.split('_')
-    N_val = int(parts[1][1:])  # e.g., from 'N3750'
-    xi_val = int(parts[2][2:]) # e.g., from 'xi4'
+    N_val = int(parts[1][1:])  
+    xi_val = int(parts[2][2:]) 
 
     if xi_val in xi_list:
         data = np.load(file)
